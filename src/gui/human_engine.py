@@ -137,38 +137,44 @@ class GameWindow:
         best_move = None
         best_score = float('-inf')
         
-        timer_expired = [False] 
+        # Tạo timer để dừng tìm kiếm sau thời gian quy định
+        timer_expired = [False]  # Dùng list để có thể thay đổi giá trị từ callback
         
         def stop_search():
             timer_expired[0] = True
         
+        # Đặt timer để dừng sau engine_time giây
         timer = threading.Timer(self.engine_time, stop_search)
         timer.start()
         
         try:
-            for depth, gamma, score, move in self.searcher.search([self.position]):
+            # Search with time limit and use opening book
+            for depth, gamma, score, move in self.searcher.search([self.position], use_book=True, 
+                                                                start_time=start_time, time_limit=self.engine_time):
+                # Kiểm tra nếu timer đã hết hạn
                 if timer_expired[0]:
+                    print(f"Dừng tìm kiếm sau {self.engine_time}s")
                     break
                     
+                # Update best move if we found a better one
                 if move and score >= gamma and score > best_score:
                     best_move = move
                     best_score = score
                     print(f"Depth {depth}: {render(move.i)}{render(move.j)} (score: {score})")
             
+            # Make the best move found
             if best_move:
                 print(f"Engine moves: {render(best_move.i)}{render(best_move.j)}")
-                print(f"Thinking time: {time.time() - start_time:.2f}s")
+                print(f"Thời gian suy nghĩ: {time.time() - start_time:.2f}s")
                 
-                if not self.position.board[best_move.j].isupper():
-                    self.position = self.position.move(best_move)
-                    if best_score == MATE_LOWER or best_score == MATE_UPPER:
-                            print("Checkmate! Black wins.")
-                            self.display_message("Checkmate! Black wins")
-                            self.game_over = True
-                            return
-                    self.check_game_over()
-                else:
-                    print("Engine tried to make an illegal move!")
+                self.position = self.position.move(best_move)
+                if best_score >= MATE_LOWER:
+                    print("Checkmate! Black wins.")
+                    self.display_message("Checkmate! Black wins")
+                    self.game_over = True
+                    return
+                
+                self.check_game_over()
             else:
                 print("Engine could not find a valid move")
                 
@@ -176,6 +182,7 @@ class GameWindow:
             print(f"Engine error: {e}")
         
         finally:
+            # Đảm bảo timer được hủy
             timer.cancel()
             self.thinking = False
 

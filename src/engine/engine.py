@@ -1,6 +1,7 @@
 from __future__ import print_function
 
-import time, math
+import time, math, os, random
+import zlib
 from itertools import count
 from collections import namedtuple, defaultdict
 
@@ -252,12 +253,65 @@ class Searcher:
         self.history = set()
         self.nodes = 0
 
+        from engine.book import PolyglotBook
+        self.book = PolyglotBook()
+        book_path = "C:\\Tanh\\ChessProgram\\src\\book\\Titans.bin"
+        try:
+            self.book.load(book_path)
+            print(f"Successfully loaded opening book: {book_path}")
+        except Exception as e:
+            print(f"Warning: Could not load opening book: {e}")
+            # Continue without book
+
+        self.opening_moves = {
+            "initial": [
+                (Move(85, 65, ""), 25),    
+                (Move(84, 64, ""), 18),    
+                (Move(96, 85, ""), 15),    
+                (Move(94, 76, ""), 10),    
+                (Move(83, 63, ""), 10),    
+                (Move(82, 62, ""), 5),    
+                (Move(86, 66, ""), 5)     
+            ],
+
+            "e4e5": [
+                (Move(96, 85, ""), 20),    
+                (Move(94, 76, ""), 15),    
+                (Move(92, 74, ""), 15)     
+            ],
+ 
+            "e4c5": [
+                (Move(96, 85, ""), 20),   
+                (Move(94, 76, ""), 15),   
+                (Move(83, 63, ""), 10)     
+            ],
+
+            "d4d5": [
+                (Move(83, 63, ""), 20),    
+                (Move(94, 76, ""), 15),    
+                (Move(96, 85, ""), 15)     
+            ],
+
+            "Nf3": [
+                (Move(84, 64, ""), 20),    
+                (Move(83, 63, ""), 15),    
+                (Move(85, 65, ""), 15)     
+            ],
+
+            "c4": [
+                (Move(94, 76, ""), 20),    
+                (Move(96, 85, ""), 20),    
+                (Move(85, 65, ""), 15)     
+            ]
+        }
+
     def bound(self, pos, gamma, depth, can_null=True):
         """ Let s* be the "true" score of the sub-tree we are searching.
             The method returns r, where
             if gamma >  s* then s* <= r < gamma  (A better upper bound)
             if gamma <= s* then gamma <= r <= s* (A better lower bound) """
         self.nodes += 1
+        
 
         # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for
         # calmness, and from this point on there is no difference in behaviour depending on
@@ -386,31 +440,202 @@ class Searcher:
 
         return best
 
-    def search(self, history):
+    def zobrist_hash(self, position):
+        """Calculate a Zobrist hash for a position compatible with polyglot format."""
+        h = 0
+        
+        zobrist_pieces = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x2E5B4D0, 0x6A45D0, 0x22B1F0, 0xB90C0, 0x42D840, 0x190F0,
+            0x9B3D0, 0x891870, 0x5A3870, 0xD21870, 0x6C3870, 0x31FE70
+        ]
+        
+        piece_index = {
+            'P': 1, 'N': 2, 'B': 3, 'R': 4, 'Q': 5, 'K': 6,
+            'p': 7, 'n': 8, 'b': 9, 'r': 10, 'q': 11, 'k': 12
+        }
+        
+        for i, p in enumerate(position.board):
+            if p in piece_index:
+                if 21 <= i < 99 and i % 10 >= 1 and i % 10 <= 8:
+                    file = (i % 10) - 1
+                    rank = 7 - ((i - 21) // 10)
+                    sq64 = rank * 8 + file
+                    
+                    piece_idx = piece_index[p]
+                    h ^= (zobrist_pieces[piece_idx] << sq64) & 0xFFFFFFFFFFFFFFFF
+        
+        castling_values = [0x31DC4, 0x77EF8, 0x6E6C4, 0x22714]
+        if position.wc[1]: h ^= castling_values[0]  # White kingside
+        if position.wc[0]: h ^= castling_values[1]  # White queenside
+        if position.bc[1]: h ^= castling_values[2]  # Black kingside
+        if position.bc[0]: h ^= castling_values[3]  # Black queenside
+        
+        ep_values = [0x7B3A0, 0x7BD50, 0x7C270, 0x7C6C0, 0x7CA40, 0x7CDC0, 0x7D080, 0x7D4B0]
+        if position.ep:
+            file = (position.ep % 10) - 1
+            if 0 <= file < 8:
+                h ^= ep_values[file]
+        
+        side_to_move = 0 if position.board.count('K') > 0 else 1  
+        if side_to_move == 1:  
+            h ^= 0x3FF8
+        
+        print(f"Calculated hash: {h:016x}")
+        return h
+    
+    def search(self, history, use_book=True, start_time=None, time_limit=None):
         """Iterative deepening MTD-bi search"""
         self.nodes = 0
-        self.history = set(history)
-        self.tp_score.clear()
+        self.history = set(history[:-1])
+        pos = history[-1]
+        
+        found_book_move = False
 
-        gamma = 0
-        # In finished games, we could potentially go far enough to cause a recursion
-        # limit exception. Hence we bound the ply. We also can't start at 0, since
-        # that's quiscent search, and we don't always play legal moves there.
-        for depth in range(1, 1000):
-            # The inner loop is a binary search on the score of the position.
-            # Inv: lower <= score <= upper
-            # 'while lower != upper' would work, but it's too much effort to spend
-            # on what's probably not going to change the move played.
-            lower, upper = -MATE_LOWER, MATE_LOWER
+        if use_book:
+            try:
+                pos_hash = self.zobrist_hash(pos)
+                book_move_value = self.book.get_move(pos_hash)
+                
+                if book_move_value is not None:
+                    print(f"Found book move value: {book_move_value:04x}")
+                    
+                    from_file = (book_move_value >> 6) & 7
+                    from_rank = (book_move_value >> 9) & 7
+                    to_file = (book_move_value >> 0) & 7
+                    to_rank = (book_move_value >> 3) & 7
+                    promotion = (book_move_value >> 12) & 7
+                    
+                    print(f"Book move: from_file={from_file}, from_rank={from_rank}, to_file={to_file}, to_rank={to_rank}, promotion={promotion}")
+                    
+                    from_sq = 21 + (7 - from_rank) * 10 + (from_file + 1)
+                    to_sq = 21 + (7 - to_rank) * 10 + (to_file + 1)
+                    
+                    print(f"Converted coordinates: from_sq={from_sq}, to_sq={to_sq}")
+                    
+                    prom_piece = "" if promotion == 0 else "NBRQ"[promotion-1]
+                    
+                    legal_moves = list(pos.gen_moves())
+                    print(f"Legal moves: {len(legal_moves)}")
+                    
+                    found_move = None
+                    for move in legal_moves:
+                        if move.i == from_sq and move.j == to_sq and move.prom == prom_piece:
+                            found_move = move
+                            print(f"Found matching legal move: {render(move.i)}{render(move.j)}{move.prom}")
+                            break
+                    
+                    if found_move:
+                        print(f"Using book move: {render(from_sq)}{render(to_sq)}{prom_piece}")
+                        found_book_move = True
+                        yield 1, 0, 1000, found_move
+                        return
+                    else:
+                        print(f"Book move {render(from_sq)}{render(to_sq)}{prom_piece} not legal in current position")
+                        
+                        print("Trying alternative coordinate conversion...")
+                        from_sq_alt = 91 - from_rank * 10 + from_file
+                        to_sq_alt = 91 - to_rank * 10 + to_file
+                        print(f"Alternative coordinates: from_sq={from_sq_alt}, to_sq={to_sq_alt}")
+                        
+                        for move in legal_moves:
+                            if move.i == from_sq_alt and move.j == to_sq_alt and move.prom == prom_piece:
+                                print(f"Found match with alternative coordinates: {render(move.i)}{render(move.j)}{move.prom}")
+                                found_book_move = True
+                                yield 1, 0, 1000, move
+                                return
+                else:
+                    print("No book move found for this position hash")
+                    
+            except Exception as e:
+                import traceback
+                print(f"Error using opening book: {e}")
+                traceback.print_exc()
+        
+        if use_book and not found_book_move and hasattr(self, 'opening_moves'):
+            try:
+                print("Trying custom opening moves...")
+                
+                key = None
+                
+                if pos.board == initial:
+                    key = "initial"
+                    print("Recognized initial position")
+                
+                elif len(history) >= 3 and history[-2].kp == 65:  # e4 vừa được đi
+                    if pos.kp == 55:  # e5 vừa được đi
+                        key = "e4e5"
+                        print("Recognized e4e5 position")
+                    elif pos.kp == 53:  # c5 vừa được đi
+                        key = "e4c5"
+                        print("Recognized e4c5 position")
+                
+                elif len(history) >= 3 and history[-2].kp == 64:  # d4 vừa được đi
+                    if pos.kp == 54:  # d5 vừa được đi
+                        key = "d4d5"
+                        print("Recognized d4d5 position")
+                
+                elif len(history) >= 3 and history[-2].kp == 85:  # Nf3 vừa được đi
+                    key = "Nf3"
+                    print("Recognized Nf3 position")
+                
+                elif len(history) >= 3 and history[-2].kp == 63:  # c4 vừa được đi
+                    key = "c4"
+                    print("Recognized c4 position")
+                
+                if key and key in self.opening_moves:
+                    print(f"Using custom moves for position: {key}")
+                    moves = self.opening_moves[key]
+                    
+                    total_weight = sum(weight for _, weight in moves)
+                    choice = random.randint(0, total_weight - 1)
+                    current_sum = 0
+                    
+                    for move, weight in moves:
+                        current_sum += weight
+                        if current_sum > choice:
+                            # Kiểm tra nước đi có hợp lệ không
+                            legal_moves = list(pos.gen_moves())
+                            for legal_move in legal_moves:
+                                if legal_move.i == move.i and legal_move.j == move.j and legal_move.prom == move.prom:
+                                    print(f"Using custom opening move: {render(move.i)}{render(move.j)}{move.prom}")
+                                    yield 1, 0, 1000, legal_move
+                                    return
+                    
+                    print("Selected custom move not legal in current position")
+            except Exception as e:
+                print(f"Error using custom opening moves: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Nếu không tìm được nước đi từ opening book hoặc custom moves, tiếp tục với tìm kiếm thông thường
+        for depth in range(1, 100):
+            lower, upper = -MATE_UPPER, MATE_UPPER
             while lower < upper - EVAL_ROUGHNESS:
-                score = self.bound(history[-1], gamma, depth, can_null=False)
+                gamma = (lower + upper + 1) // 2
+                score = self.bound(pos, gamma, depth)
                 if score >= gamma:
                     lower = score
                 if score < gamma:
                     upper = score
-                yield depth, gamma, score, self.tp_move.get(history[-1])
-                gamma = (lower + upper + 1) // 2
+            
+            # Yield results
+            self.tp_score.clear()
+            
+            # Have we found a "mate in x"?
+            if lower >= MATE_LOWER:
+                # If the score is a mate score, we convert it to "mate in x"
+                mate_in = (MATE_UPPER - lower) // 2
+                yield depth, upper, lower, self.tp_move.get(pos)
+                break
+            
+            # Check time limit
+            if start_time and time_limit and time.time() - start_time > time_limit * 0.8:
+                break
+            
+            yield depth, upper, lower, self.tp_move.get(pos)
 
+    
 
 ###############################################################################
 # UCI User interface
